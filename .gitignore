@@ -1,0 +1,6 @@
+# generated output (contains your workspace IDs)
+*.lvdash.json
+ds_*.sql
+out/
+__pycache__/
+.DS_Store
