@@ -1,6 +1,6 @@
 # Genie Code Usage Dashboard
 
-An AI/BI dashboard that tracks Genie Code usage per user: messages sent, free-allowance DBUs, billed DBUs and estimated cost. An optional second page groups usage by task type (for example, building a dashboard or analyzing data) and assigns each type a Low, Medium or High cost tier.
+An AI/BI dashboard that tracks Genie Code usage per user: messages sent, free-allowance DBUs, billed DBUs and estimated cost. An optional second page groups usage by task type (for example, building a dashboard or analyzing data) and assigns each type a Low, Medium or High cost tier. Optional per-user alerts email each user when they reach 50% of their monthly limit.
 
 It uses only Databricks system tables. Viewers do not need access to system tables.
 
@@ -17,6 +17,7 @@ Screenshots are from a Databricks demo workspace. User names are redacted.
 | `build.py` | Generates the dashboard file (`.lvdash.json`) for your workspace IDs |
 | `task_classification/*.sql` | Optional. Classifies Genie Code tasks and estimates cost per task |
 | `task_classification/render.py` | Fills your table names and workspace IDs into the SQL above |
+| `alerts/sync_user_alerts.py` | Creates one alert per user that emails them at 50% of their monthly limit |
 
 ## Part 1: Per-user usage
 
@@ -136,6 +137,66 @@ To use your own task categories, edit the label list in `02_classify_tasks.sql`.
 
 Grant the dashboard publisher SELECT on `genie_code_task_class`, `genie_code_task_cost` and `genie_code_task_tiers`. Limit `genie_code_turns` to admins, because it contains users' prompts.
 
+## Part 3: Per-user usage alerts
+
+Each user gets an email when their own Genie Code usage reaches 50% of a monthly per-user limit. The email shows only the percentage used, not DBUs or cost. The alert is notification only and does not block usage.
+
+### How it works
+
+`alerts/sync_user_alerts.py` creates one Databricks SQL alert per user. Each alert:
+
+1. Runs this query for one user, scoped to your workspace IDs and the current month (UTC):
+
+   ```
+   pct_used = 100 × (user's Genie Code DBUs this month) / per-user monthly limit
+   ```
+
+   The user's DBUs are the sum of `usage_quantity` in `system.billing.usage` for `billing_origin_product = 'GENIE'`, surfaces `GENIE_CODE` and `GENIE_CODE_CLI`, where `identity_metadata.run_as` is the user. Free and billed DBUs both count. The query returns only `pct_used`.
+2. Fires when `pct_used` is at or above the alert percentage (default 50).
+3. Emails only that user. The subject is `Genie Code usage: <pct>% of your monthly limit`.
+4. Sends once per crossing. It does not repeat while the user stays above the threshold. On the 1st of the month the percentage resets, the alert returns to OK, and the next crossing sends a new email.
+
+The script never deletes alerts. Running it again updates existing alerts in place, so it is safe to schedule.
+
+### Run it
+
+Locally, with a Databricks CLI profile:
+
+```bash
+# Preview
+python3 alerts/sync_user_alerts.py --profile my-ws --warehouse-id <warehouse_id> \
+  --workspace-ids 1234567890123456 --users ALL_ACTIVE --per-user-limit-dbus 150 --dry-run
+
+# Create or update the alerts
+python3 alerts/sync_user_alerts.py --profile my-ws --warehouse-id <warehouse_id> \
+  --workspace-ids 1234567890123456 --users ALL_ACTIVE --per-user-limit-dbus 150 \
+  --folder /Workspace/Shared/genie_code_alerts
+```
+
+In Databricks, add the script as a Python script task in a Lakeflow Job and leave out `--profile`. Schedule the job daily so that new users get an alert.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--users` | required | Comma-separated emails, or `ALL_ACTIVE` for every user with Genie Code usage this month |
+| `--per-user-limit-dbus` | 150 | Monthly DBU limit per user. 150 is the monthly free allowance |
+| `--alert-at-pct` | 50 | Percentage that triggers the email |
+| `--cron` | every 4 hours | How often each alert checks, in Quartz cron syntax, UTC |
+| `--folder` | home folder | Workspace folder for the alerts |
+| `--run-as-sp` | owner | Service principal application ID that the alerts run as |
+
+### Access and scale
+
+- Alerts run as their owner, or as `--run-as-sp` if set. That identity needs SELECT on `system.billing.usage`. Users who receive emails need no data access.
+- Recipients must be users in the workspace.
+- There is one alert per user, and each one runs a small query on its schedule. For large user counts, use a serverless warehouse and a schedule of every 4 to 12 hours. Billing data only refreshes every few hours anyway.
+- Roll out to a small group first, for example `--users alice@example.com,bob@example.com`, before using `ALL_ACTIVE`.
+
+### Limitations
+
+- Usage data lags by a few hours, so an email can arrive after the user has already gone past 50%.
+- The per-user limit is the same for every user. To give some users a different limit, run the script separately for those users with their own `--per-user-limit-dbus`.
+- For a single alert on the workspace's total spend, a native Genie budget is simpler. See Decisions for your team.
+
 ## Assumptions
 
 - Genie Code is billed pay-as-you-go, with a free allowance of 150 DBUs per user per month, starting July 8, 2026. See [Monitor and understand your Genie cost](https://docs.databricks.com/aws/en/genie/monitor-cost).
@@ -160,7 +221,8 @@ Grant the dashboard publisher SELECT on `genie_code_task_class`, `genie_code_tas
 2. Who publishes it. A service principal is recommended.
 3. Whether to use Part 2. It requires enabling Beta tracing and storing prompts in a governed table, so check with your security team first.
 4. Which task categories to use.
-5. Spend alerts. For an alert at 50% of monthly spend, use a Genie budget: in the account console, go to Usage, then Budgets, choose resource type Unity Gateway and tag `databricks-product = genie`. See [Genie budgets](https://docs.databricks.com/aws/en/genie/budgets).
+5. Per-user alerts (Part 3): the per-user monthly limit, how often to check, and which users to include.
+6. Workspace-wide spend alerts. For one alert at 50% of the workspace's monthly spend, use a Genie budget: in the account console, go to Usage, then Budgets, choose resource type Unity Gateway and tag `databricks-product = genie`. See [Genie budgets](https://docs.databricks.com/aws/en/genie/budgets).
 
 ## Validation
 
